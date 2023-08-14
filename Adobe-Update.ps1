@@ -1,57 +1,95 @@
-$installerPath = "\\br01s-fs\PUBLIC\edge\MicrosoftEdgeSetup.exe"
+# Caminho para o arquivo com a lista de computadores
 $computerListPath = "C:\Temp\computer_list.txt"
-$logPath = "C:\Temp\EdgeUpdateLog.txt"
+$computerDonePath = "C:\Temp\computer_done_acrobat.txt"
 
-# Ler a lista de computadores
-$computers = Get-Content $computerListPath
+# Credenciais para a sessão remota
+$user = "a-borjano-1"
+$password = ConvertTo-SecureString "1@2l3l4a5N" -AsPlainText -Force
+$credentials = New-Object System.Management.Automation.PSCredential ($user, $password)
 
+# URL para download da versão mais recente do Adobe Acrobat DC
+$downloadUrl = "https://ardownload2.adobe.com/pub/adobe/acrobat/win/AcrobatDC/2300320269/AcrobatDCx64Upd2300320269.msp"
+
+# Versão mínima necessária
+$requiredVersion = [Version]"23.003.20269"
+
+# Lê os hostnames dos computadores
+$computers = Get-Content -Path $computerListPath
+
+# Lista para armazenar os computadores não processados
+$computersNotProcessed = @()
+
+# Loop através de cada computador
 foreach ($computer in $computers) {
-    Write-Host "Verificando se a máquina $computer está online"
-    if (Test-Connection -ComputerName $computer -Count 1 -Quiet) {
-        Write-Host "Máquina online, acessando via hostname: $computer"
+    $processed = $false
+    Write-Host "Verificando conectividade com o computador: $computer"
 
-        # Habilitar WinRM
-        Write-Host "Habilitando WinRM na máquina $computer"
-        Invoke-Command -ComputerName $computer -ScriptBlock {
-            Enable-PSRemoting -Force -SkipNetworkProfileCheck
-        }
+    # Testa a conectividade com ping
+    $pingable = Test-Connection -ComputerName $computer -Count 1 -Quiet
+    if ($pingable) {
+        Write-Host "Conectando-se ao computador: $computer"
 
-        # Copiar o instalador para a máquina remota
-        Write-Host "Copiando o instalador para a máquina $computer"
-        Copy-Item -Path $installerPath -Destination "\\$computer\C$\Temp" -ErrorAction SilentlyContinue
+        # Estabelece uma sessão remota com credenciais
+        $session = New-PSSession -ComputerName $computer -Credential $credentials -ErrorAction SilentlyContinue
 
-        # Fechar o Edge se estiver em execução
-        Write-Host "Fechando o Edge na máquina $computer, se estiver em execução"
-        Invoke-Command -ComputerName $computer -ScriptBlock {
-            Stop-Process -Name msedge -Force -ErrorAction SilentlyContinue
-        }
+        if ($session) {
+            # Obtém a versão atual do Adobe Acrobat DC
+            $currentVersion = Invoke-Command -Session $session -ScriptBlock {
+                $adobePath = "C:\Program Files\Adobe\Acrobat DC\Acrobat\Acrobat.exe"
+                if (Test-Path -Path $adobePath) {
+                    $fileVersion = (Get-Item $adobePath).VersionInfo.ProductVersion
+                    return [Version]$fileVersion
+                }
+                return $null
+            }
 
-        # Instalar o Edge
-        Write-Host "Instalando o Edge na máquina $computer"
-        $installResult = Invoke-Command -ComputerName $computer -ScriptBlock {
-            Start-Process "C:\Temp\MicrosoftEdgeSetup.exe" -ArgumentList "/silent /install" -Wait -PassThru
-            return $LASTEXITCODE
-        } -ErrorAction SilentlyContinue
+            if ($currentVersion) {
+                Write-Host "Versão atual do Adobe Acrobat DC no computador ${computer}: $currentVersion"
 
-        if ($installResult -ne 0) {
-            Write-Host "Falha na instalação na máquina $computer com código de saída $installResult"
-            continue
-        }
+                if ($currentVersion -lt $requiredVersion) {
+                    Write-Host "Atualizando Adobe Acrobat DC de versão $currentVersion para $requiredVersion"
+                    Invoke-Command -Session $session -ScriptBlock {
+                        $tempPath = "C:\Temp"
+                        if (-not (Test-Path -Path $tempPath)) {
+                            New-Item -Path $tempPath -ItemType Directory
+                        }
+                        $installerPath = "$tempPath\AcrobatDCx64Upd2300320269.msp"
+                        Invoke-WebRequest -Uri $using:downloadUrl -OutFile $installerPath
 
-        # Verificar se a atualização foi bem-sucedida
-        Write-Host "Verificando se a atualização foi bem-sucedida na máquina $computer"
-        $edgeVersion = Invoke-Command -ComputerName $computer -ScriptBlock {
-            (Get-Item "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe").VersionInfo.ProductVersion
-        }
-        if ($edgeVersion -eq "115.0.1901.203") {
-            Write-Host "Atualização bem-sucedida na máquina $computer"
-            Add-Content -Path $logPath -Value $computer
-            $computers = $computers | Where-Object { $_ -ne $computer }
-            Set-Content -Path $computerListPath -Value $computers
+                        # Executa o instalador diretamente
+                        Start-Process -FilePath "msiexec.exe" -ArgumentList "/p $installerPath /qn" -Wait
+
+                        # Remove o arquivo do instalador
+                        Remove-Item -Path $installerPath -Force
+                    }
+
+                    # Adiciona o computador à lista de concluídos
+                    Add-Content -Path $computerDonePath -Value "$computer - Adobe Acrobat DC atualizado para versão $requiredVersion"
+                    $processed = $true
+                } else {
+                    Write-Host "Adobe Acrobat DC já está atualizado na versão $currentVersion no computador: $computer"
+                    $processed = $true
+                }
+            } else {
+                Write-Host "Adobe Acrobat DC não encontrado no computador: $computer"
+            }
+
+            # Fecha a sessão remota
+            Remove-PSSession -Session $session
         } else {
-            Write-Host "Falha na atualização na máquina $computer"
+            Write-Host "Não foi possível estabelecer uma sessão remota com o computador: $computer"
         }
     } else {
-        Write-Host "Máquina $computer está offline"
+        Write-Host "Não foi possível conectar-se ao computador: $computer"
+    }
+
+    # Adiciona o computador à lista de não processados se necessário
+    if (-not $processed) {
+        $computersNotProcessed += $computer
     }
 }
+
+# Atualiza o arquivo computer_list.txt com os computadores não processados
+Set-Content -Path $computerListPath -Value $computersNotProcessed
+
+Write-Host "Processamento concluído."
